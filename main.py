@@ -5,11 +5,10 @@ from datetime import datetime, timedelta
 from telegram import Bot
 from telegram.constants import ParseMode
 import logging
-import os
 
 # --- CONFIGURATION ---
 CHANNEL_ID = '@NewsDroid_Test'
-BOT_TOKEN = os.getenv('BOT_TOKEN', '7577336852:AAG_AV8gLnFacBIbLfl3tFyubSr3GEN30-U')
+BOT_TOKEN = '7577336852:AAG_AV8gLnFacBIbLfl3tFyubSr3GEN30-U'
 
 # Пріоритетні джерела (україномовні, закордонні)
 PRIORITY_DOMAINS = [
@@ -81,14 +80,12 @@ def filter_recent(news_list, minutes=15):
     seen_links = set()
     filtered = []
     for entry in news_list:
-        link = entry.get("link")
-        if not link or link in seen_links:
-            continue
         published = entry.get("published_parsed")
-        if not published:
+        link = entry.get("link", "")
+        if not published or not link:
             continue
         published_dt = datetime(*published[:6])
-        if published_dt > cutoff:
+        if published_dt > cutoff and link not in seen_links:
             seen_links.add(link)
             filtered.append(entry)
     return filtered
