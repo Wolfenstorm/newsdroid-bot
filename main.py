@@ -1,146 +1,127 @@
 import asyncio
-import httpx
 import feedparser
-import json
-import os
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+import httpx
+from datetime import datetime, timedelta
+from telegram import Bot, InputMediaPhoto
+from telegram.constants import ParseMode
+import logging
 
-# --- Налаштування ---
-BOT_TOKEN = "7577336852:AAGz1yyJen2HRGVzwLQB3HVWa75fO-bZ9pU"
-CHAT_ID = "-1002650930903"
+# --- CONFIGURATION ---
+CHANNEL_ID = '@NewsDroid_Test'
+BOT_TOKEN = '7577336852:AAG_AV8gLnFacBIbLfl3tFyubSr3GEN30-U'
 
+# Пріоритетні джерела (україномовні, закордонні)
+PRIORITY_DOMAINS = [
+    "ukrainian.voanews.com",
+    "www.radiosvoboda.org",
+    "www.dw.com",
+    "www.bbc.com",
+    "www.eurointegration.com.ua",
+    "www.ukrainianweek.com"
+]
+
+# Всі RSS-стрічки
 RSS_FEEDS = [
-    "https://rss.unian.net/site/news_ukr.rss",
-    "https://www.epravda.com.ua/rss/main/",
+    "https://www.unian.ua/rss/index.rss",
+    "https://www.radiosvoboda.org/api/zipoyomegoy",
+    "https://rss.dw.com/rdf/rss-uk-top",
+    "https://www.bbc.com/ukrainian/index.xml",
     "https://www.eurointegration.com.ua/rss/",
-    "https://www.radiosvoboda.org/api/zrqiteuu$ute",
-    "https://novynarnia.com/feed/",
-    "https://gordonua.com/xml/rss.xml",
-    "https://lb.ua/export/rss/all.xml",
-    "https://www.unn.com.ua/uk/rss/news_ukr.xml",
-    "https://www.ukrinform.ua/rss/block-lastnews",
-    "https://www.ukrinform.ua/rss/block-world",
+    "https://ukrainian.voanews.com/api/zgqyveuq$moq",
+    "https://tyzhden.ua/rss/",
+    "https://rss.nv.ua/rss/allnews.xml",
+    "https://www.ukrinform.ua/rss",
+    "https://www.5.ua/5_uamp.rss",
+    "https://glavcom.ua/rss/",
+    "https://news.liga.net/all/rss.xml",
+    "https://www.unn.com.ua/rss/news_uk.xml",
+    "https://www.apostrophe.ua/rss.xml",
+    "https://rubryka.com/feed/",
+    "https://hromadske.ua/feed",
+    "https://espreso.tv/rss",
+    "https://www.ukrinform.ua/rss/rubric-polytics",
     "https://zn.ua/rss.xml",
-    "https://suspilne.media/rss/news.xml",
-    "https://www.5.ua/rss",
-    "https://hromadske.ua/rss",
-    "https://glavcom.ua/rss/all.xml",
-    "https://apostrophe.ua/rss",
-    "https://interfax.com.ua/news/general.rss",
-    "https://news.liga.net/politics/rss.xml",
-    "https://mind.ua/rss/news",
-    "https://life.pravda.com.ua/rss/",
+    "https://suspilne.media/rss/all.xml",
     "https://armyinform.com.ua/feed/"
 ]
 
-SOURCE_PRIORITY = {
-    "unian.net": 1,
-    "radiosvoboda.org": 2
-}
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-POSTED_FILE = "posted.json"
+# --- FETCH & PARSE ---
+async def fetch_feed(session, url):
+    try:
+        response = await session.get(url)
+        feed = feedparser.parse(response.text)
+        return feed.entries
+    except Exception as e:
+        logger.error(f"Error fetching {url}: {e}")
+        return []
 
-# --- Завантаження вже опублікованих новин ---
-def load_posted_urls():
-    if os.path.exists(POSTED_FILE):
-        with open(POSTED_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+async def fetch_all_feeds():
+    async with httpx.AsyncClient(timeout=10) as client:
+        tasks = [fetch_feed(client, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks)
+        all_entries = [item for sublist in results for item in sublist]
+        return all_entries
 
-# --- Збереження нових опублікованих новин ---
-def save_posted_urls(posted_urls):
-    with open(POSTED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(posted_urls), f, ensure_ascii=False, indent=2)
+# --- FILTER & PRIORITIZE ---
+def prioritize_news(news_list):
+    def is_priority(entry):
+        return any(domain in entry.get("link", "") for domain in PRIORITY_DOMAINS)
 
-# --- Отримання домену (для пріоритету) ---
-def get_domain(url):
-    parsed = urlparse(url)
-    return parsed.netloc.replace("www.", "")
+    priority = [n for n in news_list if is_priority(n)]
+    regular = [n for n in news_list if not is_priority(n)]
+    return priority + regular
 
-# --- Отримання новин за останню годину ---
-def fetch_recent_news():
-    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-    news_items = []
+def filter_recent(news_list, minutes=15):
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    filtered = []
+    for entry in news_list:
+        published = entry.get("published_parsed")
+        if not published:
+            continue
+        published_dt = datetime(*published[:6])
+        if published_dt > cutoff:
+            filtered.append(entry)
+    return filtered
 
-    for feed_url in RSS_FEEDS:
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries:
-            if hasattr(entry, 'published_parsed'):
-                pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-                if pub_time >= one_hour_ago:
-                    domain = get_domain(entry.link)
-                    source_score = SOURCE_PRIORITY.get(domain, 99)
-                    news_items.append({
-                        "title": entry.title,
-                        "url": entry.link,
-                        "source_score": source_score,
-                        "length_score": len(entry.title),
-                        "published": pub_time.isoformat()
-                    })
-    return news_items
+# --- POST TO TELEGRAM ---
+async def send_to_telegram(bot, entry):
+    title = entry.get("title", "Без заголовка")
+    link = entry.get("link", "")
+    summary = entry.get("summary", "").strip().replace('<br>', '\n')
 
-# --- Публікація повідомлення ---
-async def publish_post(chat_id, message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": False,
-        "parse_mode": "HTML"
-    }
+    text = f"<b>{title}</b>\n\n{summary}\n\n<a href='{link}'>Читати повністю</a>"
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload)
-            print(f"[✅] Telegram: {response.status_code} - {response.text}")
-            response.raise_for_status()
-            return True
-        except httpx.HTTPStatusError as e:
-            print(f"[!] HTTP error: {e.response.status_code} - {e.response.text}")
-            return False
-        except Exception as e:
-            print(f"[!] Unexpected error: {e}")
-            return False
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=False,
+        )
+        logger.info(f"✅ Sent: {title}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send: {e}")
 
-# --- Основна логіка публікації новин ---
+# --- MAIN ---
 async def main():
-    print("🟢 Старт. Шукаємо новини за останню годину...")
+    logger.info("📡 Fetching RSS feeds...")
+    entries = await fetch_all_feeds()
 
-    posted_urls = load_posted_urls()
-    recent_news = fetch_recent_news()
+    logger.info(f"📋 Total entries fetched: {len(entries)}")
+    recent_news = filter_recent(entries)
+    logger.info(f"🕓 Filtered recent news: {len(recent_news)}")
 
-    new_news = [
-        news for news in recent_news
-        if news["url"] not in posted_urls
-    ]
+    sorted_news = prioritize_news(recent_news)
 
-    print(f"📥 Новин за останню годину: {len(recent_news)} | Нових: {len(new_news)}")
+    bot = Bot(token=BOT_TOKEN)
 
-    sorted_news = sorted(
-        new_news,
-        key=lambda n: (n["source_score"], -n["length_score"], n["published"])
-    )[:21]
-
-    for news in sorted_news:
-        message = f"<b>{news['title']}</b>\n{news['url']}"
-        success = await publish_post(CHAT_ID, message)
-        if success:
-            posted_urls.add(news["url"])
-        await asyncio.sleep(2)
-
-    save_posted_urls(posted_urls)
-    print("✅ Завершено. Новини опубліковані.")
-
-# --- Безкінечний цикл (автоматичний запуск щогодини) ---
-async def loop_forever():
-    while True:
-        await main()
-        print("⏳ Очікуємо наступну перевірку через 1 годину...")
-        await asyncio.sleep(3600)
+    for entry in sorted_news:
+        await send_to_telegram(bot, entry)
+        await asyncio.sleep(1.5)  # avoid flood
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(loop_forever())
-    except KeyboardInterrupt:
-        print("🛑 Зупинено вручну.")
+    asyncio.run(main())
